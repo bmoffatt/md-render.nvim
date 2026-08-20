@@ -1074,6 +1074,18 @@ function M.setup_images(win, content, ns, opts)
           end
         end
       end)
+    elseif placement.plantuml_source then
+      image.render_plantuml_async(placement.plantuml_source, function(path)
+        if path then
+          placement.plantuml_source = nil
+          -- Rebuild content so placeholder rows match actual image dimensions
+          if on_download then
+            on_download()
+          else
+            on_path_ready(path)
+          end
+        end
+      end)
     elseif placement.src_url then
       if placement.video then
         image.download_video_async(placement.src_url, function(path)
@@ -1236,7 +1248,7 @@ function M.update_images(state, win, content)
         -- New image: transmit, clear placeholder, and register in state
         state.process_placement(placement)
       end
-    elseif placement.mermaid_source or placement.src_url then
+    elseif placement.mermaid_source or placement.plantuml_source or placement.src_url then
       state.process_placement(placement)
     end
   end

@@ -496,6 +496,155 @@ function M.render_mermaid_async(source, callback)
   end)
 end
 
+-- ============================================================================
+-- PlantUML diagram rendering
+-- ============================================================================
+
+--- Get cache directory for rendered PlantUML diagrams
+---@return string
+local function get_plantuml_cache_dir()
+  local dir = vim.fn.stdpath "cache" .. "/md-render/plantuml"
+  vim.fn.mkdir(dir, "p")
+  return dir
+end
+
+--- Hex-encode a diagram source for PlantUML's "~h" URL scheme.
+--- The server also accepts deflate+custom-base64, but that needs a compression
+--- library; the hex scheme trades a longer URL for zero dependencies.
+---@param source string
+---@return string hex digits, without the "~h" prefix
+local function plantuml_encode_hex(source)
+  local parts = {}
+  for i = 1, #source do
+    parts[i] = string.format("%02x", source:byte(i))
+  end
+  return table.concat(parts)
+end
+
+--- Exposed for testing.
+---@param source string
+---@return string
+function M._plantuml_encode_hex(source)
+  return plantuml_encode_hex(source)
+end
+
+--- Find a local PlantUML renderer.
+--- Prefers a `plantuml` wrapper on PATH; otherwise uses `java -jar` only when
+--- PLANTUML_JAR explicitly points at a readable jar.
+---@return string[]? command prefix
+local _plantuml_cmd = nil
+local _plantuml_checked = false
+
+local function find_plantuml()
+  if _plantuml_checked then return _plantuml_cmd end
+  _plantuml_checked = true
+  if vim.fn.executable "plantuml" == 1 then
+    _plantuml_cmd = { "plantuml" }
+  elseif
+    vim.fn.executable "java" == 1
+    and vim.env.PLANTUML_JAR
+    and vim.fn.filereadable(vim.env.PLANTUML_JAR) == 1
+  then
+    _plantuml_cmd = { "java", "-jar", vim.env.PLANTUML_JAR }
+  end
+  return _plantuml_cmd
+end
+
+--- Check if PlantUML rendering is available, locally or via the remote server.
+--- More permissive than has_mmdc(): network availability can't be cheaply
+--- probed, so curl alone counts as viable.
+---@return boolean
+function M.has_plantuml()
+  return find_plantuml() ~= nil or vim.fn.executable "curl" == 1
+end
+
+--- Compute cache path for PlantUML source.
+--- Hashes source only: unlike mermaid's -t/-b flags, nothing here varies the
+--- output by theme or background.
+---@param source string
+---@return string
+local function plantuml_cache_path(source)
+  local hash = vim.fn.sha256(source):sub(1, 16)
+  return get_plantuml_cache_dir() .. "/" .. hash .. ".png"
+end
+
+--- Check if a PlantUML diagram is already cached (no rendering).
+---@param source string PlantUML diagram source code
+---@return string? cached_path
+function M.get_plantuml_cached(source)
+  local cache_path = plantuml_cache_path(source)
+  if vim.fn.filereadable(cache_path) == 1 then return cache_path end
+  return nil
+end
+
+--- Resolve the remote PlantUML server base URL (read fresh on every call).
+---@return string
+local function plantuml_server()
+  local server = vim.g.md_render_plantuml_server
+  if type(server) ~= "string" or server == "" then server = "https://www.plantuml.com/plantuml" end
+  return (server:gsub("/+$", ""))
+end
+
+--- Render PlantUML source via the remote HTTP server.
+---@param source string
+---@param cache_path string
+---@param callback fun(png_path: string?)
+local function render_plantuml_remote_async(source, cache_path, callback)
+  if vim.fn.executable "curl" ~= 1 then
+    callback(nil)
+    return
+  end
+  local url = plantuml_server() .. "/png/~h" .. plantuml_encode_hex(source)
+  local cmd =
+    { "curl", "-sfL", "--max-time", "15", "--max-filesize", "20000000", "-o", cache_path, url }
+  vim.system(cmd, { text = true }, function()
+    vim.schedule(function()
+      if vim.fn.filereadable(cache_path) == 1 then
+        callback(cache_path)
+      else
+        os.remove(cache_path)
+        callback(nil)
+      end
+    end)
+  end)
+end
+
+--- Render PlantUML source code to a PNG image (asynchronous, cached).
+--- Tries a local renderer first, then falls back to the remote server.
+---@param source string PlantUML diagram source code
+---@param callback fun(png_path: string?)
+function M.render_plantuml_async(source, callback)
+  local cache_path = plantuml_cache_path(source)
+  if vim.fn.filereadable(cache_path) == 1 then
+    callback(cache_path)
+    return
+  end
+
+  local cmd_prefix = find_plantuml()
+  if not cmd_prefix then
+    render_plantuml_remote_async(source, cache_path, callback)
+    return
+  end
+
+  local cmd = vim.list_extend(vim.list_extend({}, cmd_prefix), { "-tpng", "-pipe" })
+  vim.system(cmd, { stdin = source, text = false, timeout = 30000 }, function(result)
+    vim.schedule(function()
+      if result.stdout and #result.stdout > 0 then
+        local f = io.open(cache_path, "wb")
+        if f then
+          f:write(result.stdout)
+          f:close()
+        end
+      end
+      if vim.fn.filereadable(cache_path) == 1 then
+        callback(cache_path)
+      else
+        render_plantuml_remote_async(source, cache_path, callback)
+      end
+    end)
+  end)
+end
+
 --- Check if file is a format the terminal can display directly (no conversion needed)
 ---@param path string
 ---@return boolean
@@ -609,6 +758,8 @@ function M.reset_cache()
   _convert_checked = false
   _anim_cmd = nil
   _anim_checked = false
+  _plantuml_cmd = nil
+  _plantuml_checked = false
   tty_mod.reset()
 end
 

@@ -17,6 +17,7 @@ A Markdown rendering engine for Neovim. Transforms raw Markdown into richly high
 - **Images** — local and web images (PNG, JPEG, WebP, GIF, animated GIF) displayed inline via terminal graphics protocol
 - **Video** — local and web video (MP4, WebM, MOV, AVI, MKV, M4V) played as animated frames inline
 - **Mermaid diagrams** — rendered as images inline
+- **PlantUML diagrams** — rendered as images inline, via a local renderer or a remote PlantUML server
 - **CJK-aware word wrapping** — JIS X 4051 kinsoku shori + optional [BudouX](https://github.com/google/budoux) phrase segmentation via [budoux.lua](https://github.com/delphinus/budoux.lua)
 - **Clickable links** — mouse click to open URLs; hover the mouse over a link to peek the full URL in a subtle floating window; OSC 8 hyperlink support for compatible terminals
 - **`<details>` support** — collapsible sections you can toggle by clicking or with `za` / `<CR>`, respecting the `open` attribute
@@ -55,6 +56,7 @@ Or, once the plugin is installed, run `:MdRender demo` to see a built-in demo of
 | [FFmpeg](https://ffmpeg.org/) (`ffmpeg` / `ffprobe`) | JPEG/WebP → PNG conversion, animated GIF / video frame extraction | Falls back to ImageMagick (images only; video requires ffmpeg) |
 | [ImageMagick](https://imagemagick.org/) (`magick`) | JPEG/WebP → PNG, animated GIF frame extraction | `sips` (macOS) handles static conversion; animated GIF requires ffmpeg or magick |
 | [Mermaid CLI](https://github.com/mermaid-js/mermaid-cli) (`mmdc`) | Render Mermaid diagrams as images | Falls back to `npx -y @mermaid-js/mermaid-cli` |
+| [PlantUML](https://plantuml.com/) (`plantuml`, or `java` with `$PLANTUML_JAR`) | Render PlantUML diagrams as images | Falls back to the remote server at `https://www.plantuml.com/plantuml` (needs curl; override with `vim.g.md_render_plantuml_server`) |
 | [budoux.lua](https://github.com/delphinus/budoux.lua) | CJK phrase-level line breaking (BudouX) | Character-level splitting (kinsoku rules still apply) |
 | Treesitter parsers | Syntax highlighting in code blocks | Code blocks rendered without highlighting |
 | [nvim-web-devicons](https://github.com/nvim-tree/nvim-web-devicons) or [mini.icons](https://github.com/echasnovski/mini.icons) | File type icons in code block headers | Built-in icon table |
@@ -332,6 +334,21 @@ Video frame extraction requires `ffmpeg` to be installed and available in `$PATH
 <summary><strong>Mermaid diagrams don't render</strong></summary>
 
 Mermaid rendering requires the `mmdc` binary from [@mermaid-js/mermaid-cli](https://github.com/mermaid-js/mermaid-cli). If `mmdc` isn't installed globally, the plugin falls back to `npx -y @mermaid-js/mermaid-cli`, which is significantly slower on first invocation. Install it globally with `npm install -g @mermaid-js/mermaid-cli` for faster rendering.
+
+</details>
+
+<details>
+<summary><strong>PlantUML diagrams don't render</strong></summary>
+
+Fenced blocks tagged `plantuml` or `puml` are rendered locally when a `plantuml` binary is on your `PATH` (most package managers ship one), or when `java` is available and `$PLANTUML_JAR` points at a readable `plantuml.jar`. Without a local renderer, the plugin falls back to a remote PlantUML server, which requires `curl` and network access — the diagram source is sent to that server, so avoid the remote fallback for confidential diagrams by installing PlantUML locally.
+
+Point the fallback at your own server with:
+
+```lua
+vim.g.md_render_plantuml_server = "https://plantuml.example.com/plantuml"
+```
+
+Rendered diagrams are cached under `stdpath("cache")/md-render/plantuml`, keyed by the diagram source.
 
 </details>
 
