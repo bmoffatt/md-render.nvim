@@ -67,6 +67,8 @@ end
 
 local captured = {}
 local _orig_ui_send = nil
+local _orig_term_program = nil
+local _orig_ghostty_dir = nil
 
 local function setup_capture()
   captured = {}
@@ -74,6 +76,16 @@ local function setup_capture()
   vim.api.nvim_ui_send = function(data)
     table.insert(captured, data)
   end
+  -- put_image re-transmits with a=T on Ghostty instead of placing with a=p.
+  -- Without neutralizing the detection these assertions describe whichever
+  -- terminal the developer happens to run (they pass in CI, fail on Ghostty),
+  -- so pin it to a non-Ghostty terminal and let the dedicated detection tests
+  -- below set these vars themselves.
+  _orig_term_program = vim.env.TERM_PROGRAM
+  _orig_ghostty_dir = vim.env.GHOSTTY_RESOURCES_DIR
+  vim.env.TERM_PROGRAM = "xterm"
+  vim.env.GHOSTTY_RESOURCES_DIR = nil
+  image.reset_cache()
   image._set_kitty_supported(true)
   image._reset_image_id()
 end
@@ -83,6 +95,8 @@ local function teardown()
     vim.api.nvim_ui_send = _orig_ui_send
     _orig_ui_send = nil
   end
+  vim.env.TERM_PROGRAM = _orig_term_program
+  vim.env.GHOSTTY_RESOURCES_DIR = _orig_ghostty_dir
   image._set_kitty_supported(nil)
   image.reset_cache()
 end
