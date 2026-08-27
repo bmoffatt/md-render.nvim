@@ -53,6 +53,7 @@
 ---@field callout_folds MdRender.CalloutFold[]
 ---@field expandable_regions MdRender.ExpandableRegion[]
 ---@field image_placements MdRender.ImagePlacement[]
+---@field text_placements MdRender.TextPlacement[]
 ---@field footnote_anchors table<string, integer> anchor name → 0-indexed line number
 ---@field heading_anchors table<string, integer> heading slug → 0-indexed line number
 ---@field source_line_map integer[] rendered line index (1-based) → source line number (1-based)
@@ -68,6 +69,7 @@
 ---@field callout_folds MdRender.CalloutFold[]
 ---@field expandable_regions MdRender.ExpandableRegion[]
 ---@field image_placements MdRender.ImagePlacement[]
+---@field text_placements MdRender.TextPlacement[]
 ---@field footnote_anchors table<string, integer>
 ---@field source_line_map integer[]
 ---@field private _current_source_line integer
@@ -83,6 +85,7 @@ function ContentBuilder.new()
     callout_folds = {},
     expandable_regions = {},
     image_placements = {},
+    text_placements = {},
     footnote_anchors = {},
     heading_anchors = {},
     source_line_map = {},
@@ -124,6 +127,7 @@ function ContentBuilder:result()
     callout_folds = self.callout_folds,
     expandable_regions = self.expandable_regions,
     image_placements = self.image_placements,
+    text_placements = self.text_placements,
     footnote_anchors = self.footnote_anchors,
     heading_anchors = self.heading_anchors,
     source_line_map = self.source_line_map,
@@ -326,6 +330,7 @@ end
 ---@param max_width integer
 ---@param quote_prefix string
 ---@param list_marker? string
+---@param line_gap? integer blank lines to insert after each wrapped line
 function ContentBuilder:add_wrapped_markdown(
   rendered_text,
   md_highlights,
@@ -333,7 +338,8 @@ function ContentBuilder:add_wrapped_markdown(
   indent,
   max_width,
   quote_prefix,
-  list_marker
+  list_marker,
+  line_gap
 )
   local wrap_text = rendered_text
   local content_offset = 0
@@ -383,14 +389,21 @@ function ContentBuilder:add_wrapped_markdown(
   local list_prefix = list_marker or ""
   local list_continuation = string.rep(" ", list_cont_len)
 
+  line_gap = line_gap or 0
   for idx, wline in ipairs(wrapped_lines) do
     local line_prefix = quote_prefix ~= "" and (indent .. quote_prefix) or indent
     local lm = idx == 1 and list_prefix or list_continuation
     local line_hls = per_line_hls[idx]
     self:add_line(line_prefix .. lm .. wline, #line_hls > 0 and line_hls or nil)
+    for _ = 1, line_gap do
+      self:add_line ""
+    end
   end
 
   for _, entry in ipairs(link_entries) do
+    -- distribute_links assumed the wrapped lines were consecutive; spread the
+    -- entries back out over the gaps we just inserted.
+    if line_gap > 0 then entry.line = base_line + (entry.line - base_line) * (line_gap + 1) end
     table.insert(self.link_metadata, entry)
   end
 end
@@ -532,6 +545,83 @@ function ContentBuilder:_emit_image_header(indent, img_icon, icon_hl, display_na
   return #wrapped
 end
 
+--- Narrowest scaled heading worth drawing, in pre-scale cells. Below this a
+--- heading would wrap into a column of two-word fragments, which reads worse
+--- than leaving it at plain size.
+local MIN_SCALED_HEADING_WIDTH = 12
+
+--- Scale to draw a source line's heading at, and the width its text has to wrap
+--- to in order to fit once doubled. Returns nil when the heading must stay plain.
+---@param source_text string raw source line (still carrying the `#` markers)
+---@param indent string
+---@param max_width integer
+---@return integer? scale
+---@return integer? level
+---@return integer? content_width width for the text alone, indent excluded
+local function heading_scale_plan(source_text, indent, max_width)
+  local markers = source_text:match "^(#+)%s"
+  if not markers then return nil end
+  local level = math.min(#markers, 6)
+
+  local scale = require("md-render.text_size").scale_for(level)
+  if not scale then return nil end
+
+  -- `s=N` multiplies the width as well as the height, so the text has to wrap
+  -- at 1/N of the space it would normally get. The indent is not scaled (the
+  -- block starts after it), so take it off the top before dividing.
+  local avail = math.floor((max_width - vim.api.nvim_strwidth(indent)) / scale)
+  if avail < MIN_SCALED_HEADING_WIDTH then return nil end
+
+  return scale, level, avail
+end
+
+--- Register one scaled-text placement per rendered line of a heading.
+---
+--- The heading lines themselves stay in the buffer at plain size; the scaled
+--- text is painted over them later by `md-render.text_size`, so every terminal
+--- repaint falls back to the normal heading instead of to an empty line. The
+--- caller has already reserved `scale - 1` blank lines after each heading line,
+--- so the Nth line of a wrapped heading sits at `heading_line + N * scale`.
+---@param self MdRender.ContentBuilder
+---@param heading_line integer 0-indexed rendered line holding the heading
+---@param indent string
+---@param scale integer
+---@param level integer
+function ContentBuilder:add_heading_text_scale(heading_line, indent, scale, level)
+  -- The level icon is left out of the scaled run and stays as Neovim drew it.
+  -- Kitty gives a scaled run exactly `scale` cells per source cell, and it
+  -- reports these Nerd Font glyphs as one cell wide even though they are drawn
+  -- wider (hence `pad_icon`). Inside a multicell group there is no neighbouring
+  -- cell to overflow into, so the glyph gets clipped to its box and `󰉬` renders
+  -- as a bare "H".
+  -- Match the glyph plus whatever spacing follows rather than the exact
+  -- prefix: wrapping collapses runs of spaces, so a wrapped heading keeps one
+  -- space after the icon where an unwrapped one keeps two.
+  local icon_pat = "^" .. vim.pesc(require("md-render.markdown").heading_icon(level)) .. "%s*"
+
+  local segments = (#self.lines - heading_line) / scale
+  for n = 0, segments - 1 do
+    local line = heading_line + n * scale
+    local col = #indent
+    local content = (self.lines[line + 1] or ""):sub(col + 1)
+    -- Only the first line of a wrapped heading carries the icon.
+    local prefix = content:match(icon_pat)
+    if prefix then
+      col = col + #prefix
+      content = content:sub(#prefix + 1)
+    end
+    if content ~= "" then
+      table.insert(self.text_placements, {
+        line = line,
+        col = col,
+        text = content,
+        scale = scale,
+        hl = "MdRenderH" .. level,
+      })
+    end
+  end
+end
+
 --- Add a markdown-rendered line with wrapping support
 ---@param self MdRender.ContentBuilder
 ---@param text string
@@ -557,17 +647,45 @@ function ContentBuilder:add_markdown_line(text, indent, max_width, repo_base_url
     quote_prefix = rendered_text:sub(1, pos - 1)
   end
 
+  -- A scaled heading wraps at 1/scale of the usual width and reserves
+  -- `scale - 1` rows under each of its lines for the taller glyphs.
+  local scale, level, content_width
+  if heading_content then
+    scale, level, content_width = heading_scale_plan(text, indent, max_width)
+  end
+  local line_gap = scale and (scale - 1) or 0
+
+  -- `add_wrapped_markdown` sizes the text alone while the test below sizes
+  -- indent + text. Only the scaled path needs the two to agree exactly, so the
+  -- plain path keeps passing `max_width` to both as it always has.
+  local indent_w = vim.api.nvim_strwidth(indent)
+  local wrap_threshold = content_width and (indent_w + content_width) or max_width
+  local wrap_max = content_width or max_width
+
   local lines_before_fn = #self.lines
-  if vim.api.nvim_strwidth(indent) + vim.api.nvim_strwidth(rendered_text) > max_width then
-    self:add_wrapped_markdown(rendered_text, md_highlights, md_links, indent, max_width, quote_prefix, list_marker)
+  if indent_w + vim.api.nvim_strwidth(rendered_text) > wrap_threshold then
+    self:add_wrapped_markdown(
+      rendered_text,
+      md_highlights,
+      md_links,
+      indent,
+      wrap_max,
+      quote_prefix,
+      list_marker,
+      line_gap
+    )
   else
     self:add_simple_markdown(rendered_text, md_highlights, md_links, indent)
+    for _ = 1, line_gap do
+      self:add_line ""
+    end
   end
 
   -- Register heading anchor (slug → rendered line)
   if heading_content then
     local slug = markdown.heading_slug(heading_content)
     if slug ~= "" then self.heading_anchors[slug] = lines_before_fn end
+    if scale then self:add_heading_text_scale(lines_before_fn, indent, scale, level) end
   end
 
   -- Register footnote ref anchors (first occurrence per label)
@@ -813,18 +931,24 @@ local function html_table_to_pipe(html_lines)
   return result
 end
 
---- Preprocess lines to handle multi-line HTML tags.
---- HTML collapses whitespace: all lines within a tag are joined with spaces.
---- This applies to both block and inline elements per the HTML spec.
----@param lines string[]
----@return string[]
---- Check if a line starts a block-level construct (not a paragraph continuation)
+--- Check if a line opens a list item (bullet or ordered).
+--- A thematic break (`- - -`) shares the bullet's leading characters, so it
+--- is excluded here.
 ---@param line string
 ---@return boolean
-local function is_block_start(line)
+local function is_list_item(line)
+  if not (line:match "^%s*[%-%*%+]%s" or line:match "^%s*%d+[%.)]%s") then return false end
+  return not is_thematic_break(line)
+end
+
+--- Check if a line starts a block-level construct (not a paragraph continuation)
+---@param line string
+---@param in_paragraph boolean whether a paragraph is currently open
+---@return boolean
+local function is_block_start(line, in_paragraph)
   if line:match "^%s*$" then return true end
   if line:match "^#+%s" then return true end
-  if line:match "^```" or line:match "^~~~" then return true end
+  if line:match "^%s*```" or line:match "^%s*~~~" then return true end
   if line:match "^%s*|" then return true end
   if line:match "^%s*[%-%*%+]%s" then return true end
   if line:match "^%s*%d+[%.)]%s" then return true end
@@ -833,12 +957,16 @@ local function is_block_start(line)
   if line:match "^[=-]+%s*$" then return true end
   if line:match "^%[.+%]:" then return true end
   if line:match "^%[%^.+%]:" then return true end
+  if line:match "^%[!%a+%]" then return true end -- callout header (marker already stripped)
   if line:match "^%s*<" then return true end
   if line:match "^%s*!%[" then return true end
   if line:match "^%$%$$" then return true end
   if line:match "^%%%%" then return true end
   if line:match "^:::" then return true end
-  if line:match "^    %S" then return true end -- indented code block (4+ spaces)
+  -- Indented code block (4+ spaces). Per CommonMark it cannot interrupt a
+  -- paragraph, so while one is open the line is a continuation instead --
+  -- this is what keeps deeply indented list continuations joined.
+  if not in_paragraph and line:match "^    %S" then return true end
   return false
 end
 
@@ -848,6 +976,92 @@ end
 ---@return boolean
 local function has_hard_break(line)
   return line:match "%S  +$" ~= nil or line:match "%S\\$" ~= nil
+end
+
+--- Remove up to `n` leading spaces from a line (CommonMark dedents fenced
+--- code content by the opening fence's indent, no further).
+---@param line string
+---@param n integer
+---@return string
+local function strip_indent(line, n)
+  if n <= 0 then return line end
+  local ws = line:match "^ *"
+  return line:sub(math.min(#ws, n) + 1)
+end
+
+--- Split one blockquote marker level (`>` plus an optional space) off a line.
+--- Only column 0 counts as a quote here, matching the rest of the renderer.
+--- strip_quote_indent() has already moved indented quotes to column 0.
+---@param line string
+---@return string? marker, string? content
+local function split_quote_marker(line)
+  return line:match "^(>%s?)(.*)$"
+end
+
+--- Content column of a list item line: the column its text starts at, and
+--- therefore the one its continuation lines and nested blocks are indented
+--- to.
+---@param line string
+---@return integer? column nil when the line does not open a list item
+local function list_content_column(line)
+  local ws, marker, gap = line:match "^( *)([%-%*%+])( +)"
+  if not ws then
+    ws, marker, gap = line:match "^( *)(%d+[%.)])( +)"
+  end
+  if not ws or is_thematic_break(line) then return nil end
+  -- Five or more spaces after the marker start an indented code block inside
+  -- the item, so the content column is the one right after the marker.
+  return #ws + #marker + (#gap <= 4 and #gap or 1)
+end
+
+--- Move indented blockquotes to column 0 and report the indent that was
+--- taken off each line.
+---
+--- CommonMark allows up to three spaces of indentation in front of a `>`
+--- (four is an indented code block), and a blockquote nested in a list item
+--- carries the item's content column on top of that.  The rest of the
+--- renderer anchors blockquotes at column 0, so the indent is stripped here
+--- and handed back to render_document, which puts it back as display
+--- indent.  Indices are into the original `lines`, before any pass merges
+--- lines together.
+---
+--- What comes back is the *container's* content column, not the whitespace
+--- that was taken off: the up-to-three spaces in front of a marker are not
+--- content, so `   > a` at the top level renders flush left, while a quote
+--- in a list item renders under the item.  Two quote lines belong to the
+--- same blockquote only if they report the same column.
+---@param lines string[]
+---@return string[] result, table<integer, string> indents
+local function strip_quote_indent(lines)
+  local result = {}
+  local indents = {}
+  -- Content columns of the list items currently open, innermost last.
+  local item_cols = {}
+  local in_code = false
+
+  for i, line in ipairs(lines) do
+    if line:match "^%s*```" or line:match "^%s*~~~" then in_code = not in_code end
+    result[i] = line
+
+    -- A blank line neither closes a list item nor holds a quote marker.
+    if not in_code and not line:match "^%s*$" then
+      local ws = #line:match "^ *"
+      -- Anything indented less than the innermost item's content has left it.
+      while #item_cols > 0 and ws < item_cols[#item_cols] do
+        table.remove(item_cols)
+      end
+      local base = item_cols[#item_cols] or 0
+      if line:match "^ *>" and ws >= base and ws - base <= 3 then
+        if base > 0 then indents[i] = string.rep(" ", base) end
+        result[i] = line:sub(ws + 1)
+      else
+        local col = list_content_column(line)
+        if col then table.insert(item_cols, col) end
+      end
+    end
+  end
+
+  return result, indents
 end
 
 --- Join paragraph continuation lines into single lines.
@@ -862,8 +1076,16 @@ end
 --- so `source_line_map` can point back to the real buffer position.
 ---@param lines string[]
 ---@param src_indices integer[]
+---@param quote_indents? table<integer, string> per original line, from
+---   strip_quote_indent(); quote lines in different containers must not be
+---   collected into the same blockquote.
 ---@return string[] result, integer[] result_indices
-local function join_paragraph_continuations(lines, src_indices)
+local function join_paragraph_continuations(lines, src_indices, quote_indents)
+  --- Container a quote line belongs to, as its display indent.
+  local function quote_container(idx)
+    return quote_indents and quote_indents[src_indices[idx]] or ""
+  end
+
   local result = {}
   local result_indices = {}
   local para = {}
@@ -882,49 +1104,94 @@ local function join_paragraph_continuations(lines, src_indices)
     end
   end
 
-  for idx, line in ipairs(lines) do
+  local idx = 1
+  while idx <= #lines do
+    local line = lines[idx]
     local src = src_indices[idx]
-    -- Track code fences
-    if line:match "^```" or line:match "^~~~" then in_code = not in_code end
+    -- How many input lines this iteration consumed (a blockquote eats its
+    -- whole run at once).
+    local consumed = 1
 
-    -- Track multi-line HTML comments
-    if not in_code then
-      if in_html_comment then
-        -- Flush paragraph, keep comment lines separate
+    do
+      -- Track code fences (the indent a list item adds is allowed)
+      if line:match "^%s*```" or line:match "^%s*~~~" then in_code = not in_code end
+
+      -- Track multi-line HTML comments
+      if not in_code then
+        if in_html_comment then
+          -- Flush paragraph, keep comment lines separate
+          flush_para()
+          table.insert(result, line)
+          table.insert(result_indices, src)
+          if line:match "%-%->" then in_html_comment = false end
+          goto next_line
+        end
+        if line:match "^%s*<!%-%-" and not line:match "%-%->%s*$" then
+          in_html_comment = true
+          flush_para()
+          table.insert(result, line)
+          table.insert(result_indices, src)
+          goto next_line
+        end
+      end
+
+      -- A blockquote is a container of block content: strip one marker level
+      -- off the whole run and recurse, so paragraphs (and list items) inside
+      -- the quote join exactly as they do at the top level. Each output line
+      -- gets back the marker of the line that started it.
+      if not in_code and line:match "^>" then
         flush_para()
-        table.insert(result, line)
-        table.insert(result_indices, src)
-        if line:match "%-%->" then in_html_comment = false end
+        local container = quote_container(idx)
+        local inner, inner_src, markers = {}, {}, {}
+        local last = idx
+        while last <= #lines and lines[last]:match "^>" and quote_container(last) == container do
+          local marker, content = split_quote_marker(lines[last])
+          table.insert(inner, content)
+          table.insert(inner_src, src_indices[last])
+          markers[src_indices[last]] = marker
+          last = last + 1
+        end
+        consumed = last - idx
+        local joined, joined_src = join_paragraph_continuations(inner, inner_src, quote_indents)
+        for k, joined_line in ipairs(joined) do
+          local marker = markers[joined_src[k]] or "> "
+          -- A quote line with no content must not keep the marker's space.
+          if joined_line == "" then marker = (marker:gsub("%s+$", "")) end
+          table.insert(result, marker .. joined_line)
+          table.insert(result_indices, joined_src[k])
+        end
         goto next_line
       end
-      if line:match "^%s*<!%-%-" and not line:match "%-%->%s*$" then
-        in_html_comment = true
+
+      -- A list item opens a paragraph of its own: the lines that follow it
+      -- (indented to its content, or lazily unindented) belong to that same
+      -- paragraph, so they must be joined onto the marker line.
+      local starts_list_item = not in_code and is_list_item(line)
+
+      if in_code or (is_block_start(line, #para > 0) and not starts_list_item) then
+        -- Flush accumulated paragraph
         flush_para()
+        -- These lines always end their own output line, so a trailing hard
+        -- break marker is redundant: drop it so it does not leave a stray
+        -- trailing space (visible on highlighted lines such as blockquotes).
+        -- Code and HTML are left alone, where whitespace can be content.
+        if not in_code and not line:match "^    %S" and not line:match "^%s*<" then line = (line:gsub("%s+$", "")) end
         table.insert(result, line)
         table.insert(result_indices, src)
-        goto next_line
+      else
+        -- A new list item ends the previous paragraph rather than continuing it.
+        if starts_list_item then flush_para() end
+        if #para == 0 then para_src = src end
+        table.insert(para, line)
+        -- Hard line break: end the visual line here, but stay in the same
+        -- paragraph (the next line starts a new output line).
+        if has_hard_break(line) then flush_para() end
       end
+
+      ::next_line::
     end
 
-    if in_code or is_block_start(line) then
-      -- Flush accumulated paragraph
-      flush_para()
-      -- These lines always end their own output line, so a trailing hard
-      -- break marker is redundant: drop it so it does not leave a stray
-      -- trailing space (visible on highlighted lines such as blockquotes).
-      -- Code and HTML are left alone, where whitespace can be content.
-      if not in_code and not line:match "^    %S" and not line:match "^%s*<" then line = (line:gsub("%s+$", "")) end
-      table.insert(result, line)
-      table.insert(result_indices, src)
-    else
-      if #para == 0 then para_src = src end
-      table.insert(para, line)
-      -- Hard line break: end the visual line here, but stay in the same
-      -- paragraph (the next line starts a new output line).
-      if has_hard_break(line) then flush_para() end
-    end
-
-    ::next_line::
+    idx = idx + consumed
   end
 
   flush_para()
@@ -968,7 +1235,7 @@ local function preprocess_multiline_html(lines, src_indices)
         accum = nil
       end
     else
-      if l:match "^```" then in_code = not in_code end
+      if l:match "^%s*```" then in_code = not in_code end
       if not in_code then
         local tag_name = l:match "^%s*<(%a%w*)[%s>]"
         if tag_name then
@@ -1034,16 +1301,20 @@ function ContentBuilder:render_document(lines, opts)
   for i = 1, #lines do
     src_indices[i] = i
   end
+  -- Indented blockquotes are moved to column 0 here; quote_indents keeps the
+  -- indent per *original* line so the loop below can restore it on output.
+  local quote_indents
+  lines, quote_indents = strip_quote_indent(lines)
   lines, src_indices = preprocess_multiline_html(lines, src_indices)
-  lines, src_indices = join_paragraph_continuations(lines, src_indices)
+  lines, src_indices = join_paragraph_continuations(lines, src_indices, quote_indents)
   lines = markdown.renumber_ordered_lists(lines)
   -- renumber_ordered_lists rewrites text but keeps line count, so
   -- src_indices stays valid.
   local ref_links = markdown.parse_reference_links(lines)
   local footnote_defs, footnote_map = markdown.parse_footnotes(lines)
 
-  local max_width = opts.max_width or 80
-  local indent = opts.indent or "  "
+  local base_max_width = opts.max_width or 80
+  local base_indent = opts.indent or "  "
   local max_lines = opts.max_lines or math.huge
   local repo_base_url = opts.repo_base_url
   local autolinks = opts.autolinks
@@ -1058,6 +1329,10 @@ function ContentBuilder:render_document(lines, opts)
   local code_source_lines = nil
   local code_block_id = nil
   local code_block_has_truncation = false
+  -- Leading whitespace of the opening fence, e.g. a fence nested under a
+  -- list item. Content lines are dedented by it and re-indented on output,
+  -- so the block lines up with the item it belongs to.
+  local code_fence_indent = ""
   local prev_was_heading = false
   local prev_was_hr = false
   local prev_rendered_blank = false
@@ -1114,7 +1389,16 @@ function ContentBuilder:render_document(lines, opts)
       -- table itself, then restore for the caller.
       local saved_src_line = self._current_source_line
       if table_buf_start_idx then self._current_source_line = table_buf_start_idx + source_line_offset end
-      self:add_table(table_buf, indent, max_width, repo_base_url, autolinks, tbl_expanded or false, buf_dir, true)
+      self:add_table(
+        table_buf,
+        base_indent,
+        base_max_width,
+        repo_base_url,
+        autolinks,
+        tbl_expanded or false,
+        buf_dir,
+        true
+      )
       self._current_source_line = saved_src_line
       local lines_added = #self.lines - lines_before_tbl
       lines_shown = lines_shown + lines_added
@@ -1166,7 +1450,7 @@ function ContentBuilder:render_document(lines, opts)
     local det_full = det_icon .. det_rendered
     table.insert(det_hls, 1, { col = 0, end_col = #det_full, hl = "Title" })
 
-    self:add_simple_markdown(det_full, det_hls, det_links, indent)
+    self:add_simple_markdown(det_full, det_hls, det_links, base_indent)
 
     table.insert(self.callout_folds, {
       header_line = det_lines_before,
@@ -1184,7 +1468,7 @@ function ContentBuilder:render_document(lines, opts)
   local function apply_details_body_prefix(from_line, to_line)
     local prefix = "│ "
     local prefix_len = #prefix
-    local indent_len = #indent
+    local indent_len = #base_indent
 
     for i = from_line + 1, to_line do
       local line_text = self.lines[i]
@@ -1244,6 +1528,14 @@ function ContentBuilder:render_document(lines, opts)
     -- is the original buffer line, which is what consumers (cursor sync,
     -- shadow cursor, link/anchor extraction) actually expect.
     self:set_source_line(src_indices[src_idx] + source_line_offset)
+
+    -- An indented blockquote was moved to column 0 by strip_quote_indent();
+    -- its indent comes back as display indent for this line only, and the
+    -- width it takes up is off the budget. Both are the plain base for every
+    -- other line, which is what the rest of the loop reads.
+    local quote_indent = quote_indents[src_indices[src_idx]] or ""
+    local indent = base_indent .. quote_indent
+    local max_width = math.max(1, base_max_width - #quote_indent)
 
     -- Skip setext heading underline
     if skip_next_line then
@@ -1993,10 +2285,11 @@ function ContentBuilder:render_document(lines, opts)
     elseif in_math_block then
       local indented = indent .. line
       self:add_line(indented, { { col = 0, end_col = -1, hl = "MdRenderMath" } })
-    elseif line:match "^```" then
+    elseif line:match "^%s*```" then
       if not in_code_block then
         in_code_block = true
-        local info_string = line:match "^```(%S+)" or nil
+        code_fence_indent = line:match "^(%s*)"
+        local info_string = line:match "^%s*```(%S+)" or nil
         code_block_lang = info_string
         -- Split lang:filename (Qiita-style code block filename)
         local code_block_filename = nil
@@ -2011,9 +2304,9 @@ function ContentBuilder:render_document(lines, opts)
         if code_block_filename then
           local file_icon, icon_hl = get_file_icon(code_block_filename)
           file_icon = pad_icon(file_icon)
-          local icon_start = #indent
+          local icon_start = #indent + #code_fence_indent
           local icon_end = icon_start + #file_icon
-          local fname_line = indent .. file_icon .. " " .. code_block_filename
+          local fname_line = indent .. code_fence_indent .. file_icon .. " " .. code_block_filename
           local hls = {
             { col = icon_end, end_col = #fname_line, hl = "Comment" },
           }
@@ -2185,7 +2478,7 @@ function ContentBuilder:render_document(lines, opts)
 
         if not mermaid_handled and not plantuml_handled then
           if code_block_lang and code_block_start < #self.lines then
-            local cb_prefix = #indent
+            local cb_prefix = #indent + #code_fence_indent
             if in_details and details_summary_rendered then cb_prefix = cb_prefix + #"│ " end
             table.insert(self.code_blocks, {
               language = code_block_lang,
@@ -2208,10 +2501,14 @@ function ContentBuilder:render_document(lines, opts)
         code_block_lang = nil
         code_source_lines = nil
         code_block_id = nil
+        code_fence_indent = ""
       end
     elseif in_code_block then
-      table.insert(code_source_lines, line)
-      local indented = indent .. line
+      -- Dedent by the opening fence's indent, then put it back on output:
+      -- the code keeps its own indentation but not the container's.
+      local content = strip_indent(line, #code_fence_indent)
+      table.insert(code_source_lines, content)
+      local indented = indent .. code_fence_indent .. content
       local display_width = vim.api.nvim_strwidth(indented)
       if not expand_state[code_block_id] and display_width > max_width then
         code_block_has_truncation = true
@@ -2229,10 +2526,10 @@ function ContentBuilder:render_document(lines, opts)
           { col = 0, end_col = byte_pos, hl = "String" },
           { col = byte_pos, end_col = #truncated_line, hl = "Underlined" },
         })
-        detect_urls_in_code_line(self, line, #indent, byte_pos)
+        detect_urls_in_code_line(self, content, #indent + #code_fence_indent, byte_pos)
       else
         self:add_line(indented, { { col = 0, end_col = -1, hl = "String" } })
-        detect_urls_in_code_line(self, line, #indent, #indented)
+        detect_urls_in_code_line(self, content, #indent + #code_fence_indent, #indented)
       end
     else
       local handled = false
@@ -2664,29 +2961,29 @@ function ContentBuilder:render_document(lines, opts)
   if not truncated then
     flush_table()
     if lines_shown >= max_lines then
-      self:add_line(indent .. "... (truncated)", { { col = 0, end_col = -1, hl = "Comment" } })
+      self:add_line(base_indent .. "... (truncated)", { { col = 0, end_col = -1, hl = "Comment" } })
     end
   end
 
   -- Render footnote section at end of document
   if not truncated and #footnote_defs > 0 then
     -- Separator
-    self:add_line(indent)
-    local rule = indent .. string.rep("─", max_width)
+    self:add_line(base_indent)
+    local rule = base_indent .. string.rep("─", base_max_width)
     self:add_line(rule, { { col = 0, end_col = #rule, hl = "FloatBorder" } })
 
     for _, def in ipairs(footnote_defs) do
       local num = footnote_map[def.label]
-      local prefix = indent .. to_superscript(num) .. " "
+      local prefix = base_indent .. to_superscript(num) .. " "
       local prefix_display_width = vim.api.nvim_strwidth(prefix)
       local rendered_text, md_highlights, md_links =
         markdown.render(def.text, repo_base_url, autolinks, ref_links, footnote_map)
 
       local full_text = prefix .. rendered_text
       local def_first_line = #self.lines -- 0-indexed line where this def starts
-      if vim.api.nvim_strwidth(full_text) > max_width then
+      if vim.api.nvim_strwidth(full_text) > base_max_width then
         -- Wrap: use prefix on first line, spaces on continuation lines
-        local content_max_width = max_width - prefix_display_width
+        local content_max_width = base_max_width - prefix_display_width
         local wrapped_lines, line_starts = wrap_words(rendered_text, content_max_width)
         local continuation = string.rep(" ", prefix_display_width)
 
@@ -2696,7 +2993,7 @@ function ContentBuilder:render_document(lines, opts)
         local link_entries = distribute_links(md_links, wrapped_lines, line_starts, "", "", 0, base_line, 0, 0)
 
         for idx, wline in ipairs(wrapped_lines) do
-          local line_prefix = idx == 1 and prefix or (indent .. continuation:sub(#indent + 1))
+          local line_prefix = idx == 1 and prefix or (base_indent .. continuation:sub(#base_indent + 1))
           local actual_prefix = idx == 1 and prefix or continuation
           local line_hls = {}
           -- Shift highlights by prefix length
@@ -2707,7 +3004,7 @@ function ContentBuilder:render_document(lines, opts)
               hl = hl.hl,
             })
           end
-          if idx == 1 then table.insert(line_hls, { col = #indent, end_col = #prefix, hl = "Special" }) end
+          if idx == 1 then table.insert(line_hls, { col = #base_indent, end_col = #prefix, hl = "Special" }) end
           table.insert(line_hls, { col = 0, end_col = -1, hl = "Comment" })
           self:add_line(line_prefix .. wline, line_hls)
         end
@@ -2733,7 +3030,7 @@ function ContentBuilder:render_document(lines, opts)
         end
 
         local line_hls = {}
-        table.insert(line_hls, { col = #indent, end_col = #prefix, hl = "Special" })
+        table.insert(line_hls, { col = #base_indent, end_col = #prefix, hl = "Special" })
         for _, hl in ipairs(md_highlights) do
           table.insert(line_hls, hl)
         end
@@ -2756,7 +3053,7 @@ function ContentBuilder:render_document(lines, opts)
       self.footnote_anchors["footnote-def-" .. def.label] = def_first_line
       table.insert(self.link_metadata, {
         line = def_first_line,
-        col_start = #indent,
+        col_start = #base_indent,
         col_end = #prefix - 1, -- superscript number (exclude trailing space)
         url = "#footnote-ref-" .. def.label,
       })
