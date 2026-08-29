@@ -184,6 +184,7 @@ MdPreview.build_content = function(lines, opts)
     autolinks = opts.autolinks,
     source_line_offset = body_start - 1,
     buf_dir = opts.buf_dir,
+    text_scale = opts.text_scale,
   })
 
   return b:result()
@@ -228,6 +229,9 @@ function MdPreview.rebuild_visible()
       session:refresh_images()
     end
   end
+  -- `show_demo` builds its own window rather than a Session; it registers a
+  -- rebuild hook here so it is not left behind.
+  if MdPreview._demo_rebuild then pcall(MdPreview._demo_rebuild) end
 end
 
 --- Build a fresh Session from a source buffer.
@@ -2148,6 +2152,40 @@ MdPreview.show_demo = function()
       "",
       "**Bold**, ~~strikethrough~~, `inline code`, and [links](https://neovim.io) — all rendered inline. Bare URLs like https://neovim.io stay clickable. Long ones like https://github.com/neovim/neovim/blob/master/src/nvim/api/buffer.c#L123-L456 are truncated. Obsidian ==highlight== and `%%comments%%` also work.",
       "",
+      -- All six levels in one place, so the ladder can be compared at a
+      -- glance. Nothing else in the demo goes past `###`, which left `#`,
+      -- `####`, `#####` and `######` — four of the six sizes — never drawn.
+      "### Heading Levels",
+      "",
+      "Each level is drawn at its own size where the terminal implements the Kitty text sizing protocol; anywhere else they render plain.",
+      "",
+      -- Body text under every one of them, not just the headings back to back:
+      -- what the extra row costs, and how a heading sits against the text it
+      -- introduces, is only visible with something underneath it.
+      "# Level 1 — 2.00x",
+      "",
+      "A paragraph follows each heading, so the spacing between the two is visible.",
+      "",
+      "## Level 2 — 1.75x",
+      "",
+      "Every level reserves one extra rendered row for the taller glyphs.",
+      "",
+      "### Level 3 — 1.50x",
+      "",
+      "The level icon beside the heading is drawn at normal size.",
+      "",
+      "#### Level 4 — 1.40x",
+      "",
+      "The sizes below 2x come from the protocol's fractional scale.",
+      "",
+      "##### Level 5 — 1.25x",
+      "",
+      "A fractionally scaled heading goes out as several runs, each stating the width it wants.",
+      "",
+      "###### Level 6 — 1.17x",
+      "",
+      "The protocol caps that width and the fraction's denominator, which is what puts a floor here.",
+      "",
       "### Line Breaks",
       "",
       -- The two trailing spaces below are the hard line break marker itself.
@@ -2335,6 +2373,9 @@ MdPreview.show_demo = function()
   local expand_state = {}
   local opts = { buf_dir = plugin_root }
   local image_state = nil
+  local text_size = require "md-render.text_size"
+  ---@type MdRender.TextSizeState?
+  local text_size_state = nil
 
   local buf = vim.api.nvim_create_buf(false, true)
   local ns = vim.api.nvim_create_namespace "md_render_demo"
@@ -2365,6 +2406,7 @@ MdPreview.show_demo = function()
     vim.api.nvim_set_option_value("wrap", not any_expanded, { win = win })
     content = new_content
     image_state = display_utils.update_images(image_state, win, content)
+    text_size_state = text_size.refresh(text_size_state, win, content)
   end
 
   opts.autolinks = {
@@ -2393,7 +2435,18 @@ MdPreview.show_demo = function()
       content = MdPreview.build_content(demo_lines, opts)
       return content
     end,
+    on_content_applied = function(new_content)
+      text_size_state = text_size.refresh(text_size_state, win, new_content)
+    end,
   })
+  text_size_state = text_size.attach(win, content)
+
+  -- The demo is not a Session, so `rebuild_visible` cannot find it the way it
+  -- finds previews. Hand it a way in, or `:MdRender textsize` would leave the
+  -- demo showing rows reserved for a scale it no longer uses.
+  MdPreview._demo_rebuild = function()
+    if win and vim.api.nvim_win_is_valid(win) then rebuild() end
+  end
 
   display_utils.setup_float_keymaps(buf, ns, win, content, demo_float_win, {
     get_content = function()
