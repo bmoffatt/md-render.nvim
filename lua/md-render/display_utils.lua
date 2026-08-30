@@ -597,6 +597,37 @@ end
 ---@field autocmd_ids integer[]
 
 --- Transmit all images and display them. Returns state for re-display and cleanup.
+--- `User` event fired after a full-screen repaint, so that everything else
+--- drawing straight to the terminal can put itself back.
+---
+--- Kitty graphics placements and the OSC 66 runs |md-render-text-size| paints
+--- both live outside Neovim's grid, and both are destroyed by a full repaint —
+--- `redraw!` here, `:mode` there. Whichever module repaints last used to erase
+--- the other's work and leave it erased, because neither can observe a repaint
+--- it did not perform. Announcing it turns that into a hand-off.
+M.REPAINT_EVENT = "MdRenderRepaint"
+
+--- Tell the other terminal-drawing modules that the screen was just repainted.
+---@param source string who repainted, so the sender can ignore its own event
+function M.announce_repaint(source)
+  pcall(vim.api.nvim_exec_autocmds, "User", {
+    pattern = M.REPAINT_EVENT,
+    modeline = false,
+    data = { source = source },
+  })
+end
+
+--- Whether a placement's image still has to be produced — rendered from its
+--- source or downloaded — before there is a file to transmit.
+---
+--- These are the placements that reach `process_placement` without a `path`,
+--- and the reason the retry in `place_images` cannot be keyed on `path` alone.
+---@param placement MdRender.ImagePlacement
+---@return boolean
+local function has_async_source(placement)
+  return placement.mermaid_source ~= nil or placement.plantuml_source ~= nil or placement.src_url ~= nil
+end
+
 ---@param win integer
 ---@param content MdRender.Content
 ---@param ns integer?
@@ -694,6 +725,13 @@ function M.setup_images(win, content, ns, opts)
         and placement_near_viewport(placement)
       then
         placement._retries = (placement._retries or 0) + 1
+        process_placement(placement)
+      elseif has_async_source(placement) and not placement._async_started and placement_near_viewport(placement) then
+        -- A Mermaid diagram or a remote image that was off-screen when the
+        -- window opened has no `path` yet, so the branch above can never pick
+        -- it up and it would sit on its placeholder forever. Scrolling it into
+        -- view is what asks for it — the same laziness static images get,
+        -- rather than rendering and downloading everything up front.
         process_placement(placement)
       end
     end
@@ -868,6 +906,7 @@ function M.setup_images(win, content, ns, opts)
       vim.schedule(function()
         place_images()
         resume_anim_timers()
+        M.announce_repaint "image"
       end)
     end
   end
@@ -1064,6 +1103,11 @@ function M.setup_images(win, content, ns, opts)
       end
     end
 
+    -- Remember that the render or the download was asked for. `place_images`
+    -- runs on every scroll, and without this it would ask again — a second
+    -- mmdc, a second curl — for as long as the first one is in flight.
+    if not placement.path then placement._async_started = true end
+
     if placement.path then
       on_path_ready(placement.path)
     elseif placement.mermaid_source then
@@ -1167,6 +1211,21 @@ function M.setup_images(win, content, ns, opts)
     table.insert(state.autocmd_ids, id)
   end
 
+  -- Somebody else repainted the screen, which dropped our placements with it.
+  -- Not filtered by window: a full repaint clears the whole screen, so every
+  -- image state has to put itself back, not just the one that was scrolled.
+  table.insert(
+    state.autocmd_ids,
+    vim.api.nvim_create_autocmd("User", {
+      group = augroup,
+      pattern = M.REPAINT_EVENT,
+      callback = function(ev)
+        if type(ev.data) == "table" and ev.data.source == "image" then return end
+        place_images()
+      end,
+    })
+  )
+
   vim.api.nvim_create_autocmd("WinClosed", {
     group = augroup,
     pattern = tostring(win),
@@ -1252,7 +1311,7 @@ function M.update_images(state, win, content)
         -- New image: transmit, clear placeholder, and register in state
         state.process_placement(placement)
       end
-    elseif placement.mermaid_source or placement.plantuml_source or placement.src_url then
+    elseif has_async_source(placement) then
       state.process_placement(placement)
     end
   end

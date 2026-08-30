@@ -172,7 +172,7 @@ The plugin exposes a single `:MdRender` command with subcommands:
 | `:MdRender toggle` | Toggle the current window between source and render mode in place |
 | `:MdRender split` | Open a split showing source and rendered Markdown (honours `:vert`, `:tab`, `:topleft`, `:botright`) |
 | `:MdRender auto [on\|off\|toggle]` | **[experimental]** Auto-toggle source/render based on Insert mode (per buffer) |
-| `:MdRender textsize [on\|off\|toggle]` | **[experimental]** Scale `#` / `##` headings via the Kitty text sizing protocol |
+| `:MdRender textsize [on\|off\|toggle]` | **[experimental]** Scale headings via the Kitty text sizing protocol (on by default) |
 | `:MdRender pager` | Pager mode — full-screen, no chrome, `q` to quit Neovim |
 | `:MdRender demo` | Show a demo window with all supported Markdown notations |
 
@@ -211,27 +211,59 @@ See `:help :MdRender-auto` for behavior details — the `i` / `I` / `a` / `A` / 
 
 ### Scaled headings (experimental, Kitty only)
 
-> **Experimental.** New, opt-in, and Kitty-only. The UX may change or the feature may be withdrawn. Please report issues or rough edges.
+> **Experimental.** New and Kitty-only. The UX may change or the feature may be withdrawn. Please report issues or rough edges.
 
-Kitty 0.40 added the [text sizing protocol](https://sw.kovidgoyal.net/kitty/text-sizing-protocol/) (OSC 66), which draws text at a multiple of the base font size. md-render can use it to render `#` and `##` headings at double size:
+Kitty 0.40 added the [text sizing protocol](https://sw.kovidgoyal.net/kitty/text-sizing-protocol/) (OSC 66), which draws text at a multiple of the base font size. md-render uses it to give every heading level its own size:
+
+| Level | `#` | `##` | `###` | `####` | `#####` | `######` |
+|---|---|---|---|---|---|---|
+| Size | 2.00x | 1.75x | 1.50x | 1.40x | 1.25x | 1.17x |
+
+This is on whenever the terminal supports it — no configuration needed. Turn it off with `:MdRender textsize off`, or permanently with:
 
 ```lua
-require("md-render.text_size").setup { enabled = true }
+require("md-render.text_size").setup { enabled = false }
 ```
 
-Or toggle it at runtime with `:MdRender textsize`.
+The ladder is fixed. Kitty's `s=` scale multiplies the *cells* a run occupies, not just the font, so every level stays at `s=2` — one extra rendered row, never more — and the sizes below 2x come from the protocol's fractional scale plus a `w=` width per run. The protocol caps `d` at 15 and `w` at 7, which is why the deepest level lands on 1.17x rather than something closer to plain.
 
-Which headings scale is fixed — `#` and `##` at `s=2`, everything else plain. `s=2` doubles the width as well as the height, so deeper levels stop fitting into a preview window. Long headings wrap at half the usual width so every `#` / `##` scales, each wrapped line getting its own two-row block.
+Headings wrap at `1 / size` of the usual width so that every level scales rather than only the ones that happen to fit, and each wrapped line gets its own two-row block.
+
+A fractionally scaled heading goes out as several runs, because each has to declare its width in whole cells while its text does not measure a whole number of them. That width is rounded up — Kitty drops characters that do not fit — and the runs are cut where the leftover cell disappears: at a boundary that comes out exact where there is one, and otherwise after a space, so the slack reads as a slightly wider word gap instead of a hole in a word.
 
 The scaled text is written straight to the terminal, the same way inline images are, so Neovim knows nothing about it. The plain-size heading stays in the buffer underneath and the scaled text is painted over it — every terminal repaint degrades to the normal heading rather than to a blank line, and `y` / `/` / `:w` still see the real text.
 
 Known limitations:
 
-- **Kitty >= 0.40 only.** Support is detected by asking the terminal to identify itself (XTVERSION) and requires a positive answer. This is deliberately strict: some terminals swallow an OSC 66 sequence *together with its payload text*, which would delete the heading rather than fall back to unscaled text.
+- **Kitty >= 0.40 only.** Support is detected by asking the terminal to identify itself (XTVERSION) and requires a positive answer. This is deliberately strict: some terminals swallow an OSC 66 sequence *together with its payload text*, which would delete the heading rather than fall back to unscaled text. Everywhere else the feature costs nothing and headings render as they always did.
 - Inline formatting inside a heading (inline code, links, `==highlight==`) loses its colors while scaled.
+- Every level reserves a two-row block while only `#` fills it, so the rest are centered in theirs (`v=2`) instead of sitting against the top edge, which is the protocol's default. At `######` — 1.17x in a block twice as tall — the top edge left almost a whole row empty under the heading.
+- The level icon stays at normal size, but goes out as a run of its own rather than as the plain text underneath, so it is centered in the same block and stays level with the heading it labels (`n=1:d=2` against `s=2` cancels the cell scale exactly). Its own run is also what keeps it legible: Kitty gives a scaled run exactly `s` cells per source cell, and these Nerd Font glyphs report as one cell wide while being drawn wider, so sharing the heading's run would clip the icon — `󰉬` would render as a bare "H". Alone, `w=1` gives it the two-cell block the icon already occupies, and it fits.
 - A heading whose second row would fall outside the window stays plain until scrolled into view.
-- A repaint md-render cannot observe (another plugin forcing a redraw, a message or popup overlapping the window) leaves the heading plain until the next scroll or cursor movement.
-- Each layout change costs a full-screen repaint to clear the previous scaled run, so scrolling is more expensive than usual.
+- A repaint by anything else (another plugin forcing a redraw, a message or popup overlapping the window, the terminal shifting cells for a mouse scroll) drops the heading back to plain size, and there is no way to stop that happening. Recovery is on three signals, in order of how quickly they arrive: a scroll, resize, or window opening or closing repaints at once; any redraw at all is picked up from a decoration provider on the tick after it; and `SafeState` covers the rest, rate-limited, with a 500 ms timer behind it for a repaint that never settles. md-render's own repaints are handled properly rather than waited out — inline images and scaled headings both draw outside Neovim's grid and are both destroyed by a full repaint, so whichever of the two repaints announces it and the other puts itself back at once.
+- **A plugin that repaints inside `eventignore = "all"` costs a frame that cannot be recovered any sooner.** Autocmds are how everything above learns that anything happened, and that setting silences all of them. The decoration provider still fires — it is not an autocmd — so the heading comes back on the next tick, but it does go for that one frame. [nvim-scrollview](https://github.com/dstein64/nvim-scrollview) is the known case: it opens a float the size of the whole editor, moves a dozen small ones and closes them again, about twenty times a second while the mouse moves, all of it inside `eventignore = "all"`. Measured over fifteen seconds, 308 calls to `nvim_open_win` produced one `WinNew`. To turn it off while a preview is on screen, match on `b:md_render` (set on every buffer md-render renders into) rather than pairing open and close events — a preview can be opened more than once and split by hand, and asking "is one open" needs no bookkeeping:
+
+  ```lua
+  local off = false
+  vim.api.nvim_create_autocmd({ "WinNew", "WinClosed", "BufWinEnter" }, {
+    callback = vim.schedule_wrap(function()
+      local want = false
+      for _, w in ipairs(vim.api.nvim_list_wins()) do
+        if vim.b[vim.api.nvim_win_get_buf(w)].md_render then
+          want = true
+          break
+        end
+      end
+      if want ~= off then
+        off = want
+        vim.cmd(want and "ScrollViewDisable" or "ScrollViewEnable")
+      end
+    end),
+  })
+  ```
+
+- Each layout change costs a full-screen repaint to clear the previous scaled run, so scrolling is more expensive than usual. When the window also holds images the image redraw does that clearing, and the scaled text is simply written after it.
+- The Telescope and Snacks previewers opt out. They redraw on every cursor step, and a full-screen repaint per step is not something a picker can afford.
 
 See `:help md-render-text-size` for the full rationale.
 

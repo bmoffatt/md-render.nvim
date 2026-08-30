@@ -21,6 +21,7 @@ Usage							       |md-render-usage|
   Display Utilities				       |md-render-display-utils|
   Image							       |md-render-image|
 Example							     |md-render-example|
+Buffer Variables				 |md-render-buffer-variables|
 Highlight Groups					  |md-render-highlights|
 Optional Dependencies					|md-render-dependencies|
 
@@ -185,8 +186,8 @@ still registered as deprecated aliases — see |md-render-deprecated-commands|.
 	  auto        - [EXPERIMENTAL] auto-toggle around Insert mode;
 	                takes a second arg `on` / `off` / `toggle`
 	                (defaults to `toggle`)
-	  textsize    - [EXPERIMENTAL] scale `#` / `##` headings with the
-	                Kitty text sizing protocol; takes a second arg
+	  textsize    - [EXPERIMENTAL] scale headings with the Kitty text
+	                sizing protocol (on by default); takes a second arg
 	                `on` / `off` / `toggle` (defaults to `toggle`)
 	  demo        - show a demo window with every supported notation
 
@@ -321,6 +322,14 @@ still registered as deprecated aliases — see |md-render-deprecated-commands|.
 	mirrors the other to the corresponding mapped line, with the
 	cursor placed at the same window row so the views stay aligned.
 
+	A cursor that already maps to its counterpart stays where it is.
+	Several source lines can share one rendered line — a collapsed
+	<details>, a table, a figure — and mapping that line back would
+	otherwise pull the cursor to the first line of the block.  A view
+	within a line of where the map points is likewise left alone, so
+	the other side is not scrolled back over the line it just
+	scrolled by itself.
+
 	Closing the split window with `:q` or `<C-w>c` does NOT destroy
 	the render buffer; it stays cached on the source for future
 	toggles or splits.
@@ -346,9 +355,10 @@ still registered as deprecated aliases — see |md-render-deprecated-commands|.
 
 							  *:MdRender-textsize*
 :MdRender textsize [on|off|toggle] ~
-	[EXPERIMENTAL] Draw `#` and `##` headings at twice the base font
-	size using the Kitty text sizing protocol.  Off by default; see
-	|md-render-text-size| for what the feature does and does not do.
+	[EXPERIMENTAL] Draw headings larger than the base font size using the
+	Kitty text sizing protocol.  On by default wherever the terminal
+	supports it; see |md-render-text-size| for what the feature does and
+	does not do.
 
 	With no argument this toggles.  Turning it on when the terminal does
 	not implement the protocol prints a warning and changes nothing.
@@ -364,20 +374,31 @@ still registered as deprecated aliases — see |md-render-deprecated-commands|.
 ------------------------------------------------------------------------------
 Scaled headings (experimental)				*md-render-text-size*
 
-[EXPERIMENTAL] This is new, opt-in, and Kitty-only.  The UX may change or the
-feature may be withdrawn.  Please report issues or rough edges.
+[EXPERIMENTAL] This is new and Kitty-only.  The UX may change or the feature
+may be withdrawn.  Please report issues or rough edges.
 
 Kitty 0.40 added the text sizing protocol (OSC 66), which draws a run of text
-at a multiple of the base font size.  md-render can use it to render `#` and
-`##` headings at double size: >lua
+at a multiple of the base font size.  md-render uses it to give every heading
+level its own size:
 
-	require("md-render.text_size").setup { enabled = true }
+	#	2.00x
+	##	1.75x
+	###	1.50x
+	####	1.40x
+	#####	1.25x
+	######	1.17x
+
+This is on whenever the terminal supports it, with no configuration.  Turn it
+off for the session with `:MdRender textsize off`, or permanently with: >lua
+
+	require("md-render.text_size").setup { enabled = false }
 <
-Or toggle it at runtime with |:MdRender-textsize|.
-
-Which headings scale is fixed: `#` and `##` at `s=2`, everything else plain.
-`s=2` doubles the width as well as the height, so deeper levels stop fitting
-into a preview window.
+The ladder is fixed.  Kitty's `s=` multiplies the *cells* a run occupies and
+not only the font, so every level stays at `s=2` — one extra rendered row,
+never more — and the sizes below 2x come from the protocol's fractional scale
+(`n=` / `d=`) together with a per-run width (`w=`).  The protocol caps `d` at
+15 and `w` at 7, which is why the deepest level lands on 1.17x rather than on
+something closer to plain size.
 
 How it works: ~
 
@@ -390,12 +411,34 @@ about it, which drives most of the design:
   rather than to a blank line, and `y` / `/` / `:w` see the real text.
 - A scaled heading reserves one extra rendered line for the taller glyphs,
   the way an image placement reserves rows.
-- Long headings wrap at half the usual width so that every `#` / `##` scales,
-  each wrapped line getting its own two-row block.
-- The level icon is left at normal size.  Kitty gives a scaled run exactly
-  `scale` cells per source cell, and these Nerd Font glyphs report as one
-  cell wide while being drawn wider, so inside a scaled run the icon would be
-  clipped (`󰉬` would render as a bare "H").
+- Headings wrap at `1 / size` of the usual width so that every level scales
+  rather than only the ones that happen to fit, each wrapped line getting its
+  own two-row block.
+- A fractionally scaled heading goes out as several runs rather than one.
+  `n=` / `d=` shrink the font without shrinking the cells, so each run has to
+  state the width it wants in `w=`, and `w` is capped at 7 cells.
+- That width is a whole number of cells while the text in it is not, so `w`
+  is rounded up — never to nearest.  Given less room than its text needs
+  Kitty drops the overflowing characters, which is far worse than the cost
+  of rounding up: a cell or so of slack at the right-hand end of the run.
+  Runs are cut where that slack disappears, preferring a boundary that comes
+  out exact and otherwise ending the run after a space, so the leftover
+  paints as a slightly wider word gap rather than as a hole in a word.  Text
+  of one uniform character width — plain ASCII, or plain CJK — always lands
+  exactly and never needs either.
+- Every level reserves a two-row block while only `#` fills it, so the rest
+  are centered in theirs (`v=2`) rather than sitting against the top edge,
+  which is the protocol's default.  At `######`, 1.17x in a block twice as
+  tall, the top edge left almost a whole row empty underneath the heading.
+- The level icon is drawn at normal size, but as a run of its own rather than
+  as the plain text underneath, so that it is centered in the same block and
+  stays level with the heading it labels.  `n=1:d=2` against `s=2` cancels
+  the cell scale exactly, which is what keeps it at normal size.
+  Its own run is also what keeps it legible: Kitty gives a scaled run exactly
+  `s` cells per source cell, and these Nerd Font glyphs report as one cell
+  wide while being drawn wider, so sharing the heading's run would clip the
+  icon (`󰉬` would render as a bare "H").  Alone, `w=1` gives it a two-cell
+  block — the width the icon already occupies — and it fits.
 - Repainting happens on scroll, resize and cursor movement, debounced.  While
   a scroll is in flight the delay is stretched so a held `<C-e>` costs one
   repaint instead of one per step.
@@ -406,17 +449,63 @@ Limitations: ~
   itself (XTVERSION) and requires a positive answer; a silent or non-Kitty
   terminal disables the feature.  This is deliberately strict because some
   terminals swallow an OSC 66 sequence together with its payload text, which
-  would delete the heading rather than fall back to unscaled text.
+  would delete the heading rather than fall back to unscaled text.  Anywhere
+  else the feature costs nothing and headings render as they always did.
 - Inline formatting inside a heading (inline code, links, `==highlight==`)
   loses its colors while scaled — the whole run is drawn in the heading
   highlight.
 - A heading whose second row would fall outside the window stays plain until
   it is scrolled into view.
-- A repaint that md-render cannot observe (another plugin forcing a redraw, a
-  message or popup overlapping the window) leaves the heading plain until the
-  next scroll or cursor movement.
+- A repaint by anything else (another plugin forcing a redraw, a message or
+  popup overlapping the window, the terminal shifting cells for a mouse
+  scroll) drops the heading back to plain size, and there is no way to stop
+  that happening.  Recovery is on three signals, in order of how quickly they
+  arrive: a scroll, resize, or window opening or closing repaints at once; any
+  redraw at all is picked up from a decoration provider on the tick after it;
+  and |SafeState| covers the rest, rate-limited, with a 500 ms timer behind it
+  for a repaint that never settles.  md-render's own repaints are handled
+  properly rather than waited out: inline images and scaled headings both draw
+  outside Neovim's grid and are both destroyed by a full repaint, so whichever
+  of the two repaints announces it and the other puts itself back at once.
+                                                 *md-render-eventignore*
+- A plugin that repaints inside 'eventignore' `= "all"` costs a frame that
+  cannot be recovered any sooner.  Autocmds are how everything above learns
+  that anything happened, and that setting silences all of them.  The
+  decoration provider still fires — it is not an autocmd — so the heading
+  comes back on the next tick, but it does go for that one frame.
+  nvim-scrollview (https://github.com/dstein64/nvim-scrollview) is the known
+  case: it opens a float the size of the whole editor, moves a dozen small
+  ones and closes them again, about twenty times a second while the mouse
+  moves, all of it inside 'eventignore' `= "all"`.  Measured over fifteen
+  seconds, 308 calls to `nvim_open_win` produced one |WinNew|.
+  To turn it off while a preview is on screen, match on |b:md_render| rather
+  than pairing open and close events — a preview can be opened more than once
+  and split by hand, and asking "is one open" needs no bookkeeping: >lua
+
+    local off = false
+    vim.api.nvim_create_autocmd({ "WinNew", "WinClosed", "BufWinEnter" }, {
+      callback = vim.schedule_wrap(function()
+        local want = false
+        for _, w in ipairs(vim.api.nvim_list_wins()) do
+          if vim.b[vim.api.nvim_win_get_buf(w)].md_render then
+            want = true
+            break
+          end
+        end
+        if want ~= off then
+          off = want
+          vim.cmd(want and "ScrollViewDisable" or "ScrollViewEnable")
+        end
+      end),
+    })
+<
 - Each layout change costs a full-screen repaint to clear the previous scaled
-  run, so scrolling is more expensive than usual.
+  run, so scrolling is more expensive than usual.  When the window also holds
+  images the image redraw does that clearing, and the scaled text is written
+  after it rather than repainting the screen a second time.
+- |md-render-telescope| and |md-render-snacks| previews opt out.  They redraw
+  on every cursor step, and a full-screen repaint per step is not something a
+  picker can afford.
 
 ------------------------------------------------------------------------------
 Deprecated commands				 *md-render-deprecated-commands*
@@ -945,6 +1034,33 @@ A complete example showing how to render Markdown and display it in a buffer:
   local win = vim.api.nvim_get_current_win()
   md.display_utils.setup_images(win, content, ns)
 <
+
+==============================================================================
+BUFFER VARIABLES				 *md-render-buffer-variables*
+
+						       *md-render-b-md-render*
+							       *b:md_render*
+b:md_render ~
+	`true` on every buffer md-render renders into — the floating preview,
+	the tab and split views, the pager, the buffer |:MdRender-toggle|
+	swaps in, and |:MdRender-demo|.  Set nowhere else, so a configuration
+	can recognise one without matching on a buffer name or a filetype,
+	both of which other plugins and the user are free to change.
+
+	Buffer-local rather than window-local deliberately.
+	|:MdRender-toggle| keeps its window and swaps the buffer inside it, and
+	splitting a preview by hand creates a window this plugin never sees;
+	the mark has to travel with the buffer for either to be recognised.
+	To ask whether a preview is on screen, walk the windows: >lua
+
+	  local function preview_visible()
+	    for _, w in ipairs(vim.api.nvim_list_wins()) do
+	      if vim.b[vim.api.nvim_win_get_buf(w)].md_render then return true end
+	    end
+	    return false
+	  end
+<
+	See |md-render-eventignore| for what this is useful for.
 
 ==============================================================================
 HIGHLIGHT GROUPS					  *md-render-highlights*

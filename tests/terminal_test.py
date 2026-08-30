@@ -6,11 +6,12 @@ Sits between the unit tests (which check the bytes md-render emits) and the
 visual regression tests (which compare pixels). The trick that makes this layer
 cheap is that `kitty @ get-text --ansi` round-trips OSC 66 verbatim:
 
-    ESC ] 66 ; s=2 ; Short Heading ESC \\
+    ESC ] 66 ; s=2 ; Level One Heading ESC \\
+    ESC ] 66 ; s=2:n=3:d=4:w=6 ; Level Th ESC \\
 
-So "is this heading drawn at double size" is answerable as an exact string
-match, with no screenshot, no SSIM, and none of the font or timing sensitivity
-that comes with comparing images.
+So "is this heading drawn at 1.5x" is answerable as an exact string match, with
+no screenshot, no SSIM, and none of the font or timing sensitivity that comes
+with comparing images.
 
 Usage:
     tests/terminal_test.py                 # auto-detect kitty, use xvfb if present
@@ -32,12 +33,85 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# nf-md-format_header_1 .. _3. Kitty gives a scaled run exactly `scale` cells
-# per source cell while reporting these as one cell wide, so an icon inside a
-# run gets clipped and renders as a bare "H". They must stay out of the payload.
-HEADING_ICONS = ["\U000f026b", "\U000f026c", "\U000f026d"]
+# nf-md-format_header_1 .. _6. Kitty gives a scaled run exactly `s` cells per
+# source cell while reporting these as one cell wide, so an icon sharing a run
+# with the heading text gets clipped and renders as a bare "H". It goes out on
+# its own instead, in a block `w=1` wide — which is the two cells `pad_icon`
+# already reserves — so the glyph has the room it is actually drawn in.
+HEADING_ICONS = [chr(cp) for cp in range(0xF026B, 0xF026B + 6)]
+
+# The icon run's own scale. `n=1:d=s` cancels the cell scale exactly, so the
+# glyph stays at plain size; `v` is what it is there for, aligning it with the
+# heading text inside the same block.
+ICON_SCALE = (2, 1, 2)
+
+# Where a fractionally scaled run sits in its block: 0 top, 1 bottom, 2
+# centered. Kitty ignores it when there is no fraction, which is why level 1's
+# text run is exempt below.
+VERTICAL_ALIGN = 2
 
 OSC66 = re.compile(rb"\x1b\]66;([^;]*);(.*?)(?:\x1b\\|\x07)", re.S)
+
+# Heading level → the scale md-render is supposed to send for it, as
+# `(s, n, d)`. Level 1 scales by whole cells and needs no fraction; the rest
+# shrink the font inside those cells with `n` / `d`, which means they also have
+# to state a per-run width in `w`.
+#
+# Compared key by key rather than as a string: Kitty stores the metadata as
+# parsed values and `get-text` re-emits them in its own order, so what comes
+# back for `s=2:n=3:d=4:w=6` is `w=6:s=2:n=3:d=4`.
+LEVEL_SCALE = {
+    1: (2, None, None),
+    2: (2, 7, 8),
+    3: (2, 3, 4),
+    4: (2, 7, 10),
+    5: (2, 5, 8),
+    6: (2, 7, 12),
+}
+
+# The text each level's heading carries in the fixture. A fractionally scaled
+# heading goes out as several runs, so these are matched against the level's
+# payloads joined back together rather than against a single run.
+LEVEL_TEXT = {
+    1: "Level One Heading",
+    2: "Level Two Heading",
+    3: "Level Three Heading",
+    4: "Level Four Heading",
+    5: "Level Five Heading",
+    6: "Level Six Heading",
+}
+
+
+def parse_meta(meta):
+    """`w=6:s=2:n=3:d=4` -> {'w': 6, 's': 2, 'n': 3, 'd': 4}."""
+    out = {}
+    for pair in meta.split(":"):
+        key, _, value = pair.partition("=")
+        if value.isdigit():
+            out[key] = int(value)
+    return out
+
+
+def is_icon_run(meta):
+    """True for the plain-size run a level icon goes out in."""
+    kv = parse_meta(meta)
+    return (kv.get("s"), kv.get("n"), kv.get("d")) == ICON_SCALE and kv.get("w") == 1
+
+
+def level_of(meta):
+    """Heading level a run's metadata belongs to, or None if unrecognised.
+
+    Icon runs are not a level: they carry the glyph, not the heading text, and
+    every level sends the same metadata for them.
+    """
+    if is_icon_run(meta):
+        return None
+    kv = parse_meta(meta)
+    got = (kv.get("s"), kv.get("n"), kv.get("d"))
+    for level, expected in LEVEL_SCALE.items():
+        if got == expected:
+            return level
+    return None
 
 passed = failed = 0
 
@@ -81,6 +155,16 @@ def run_kitty(kitty, enabled, workdir):
         # minimum-width guard declines to scale anything, which would look like
         # a failure. Ask for room.
         "-o", "font_size=10",
+        # And a window *short* enough scrolls the later headings out of the
+        # float, which reads the same way: the placements are built and simply
+        # never drawn. Kitty opens at 80x24 cells by default no matter how big
+        # the display is, which fits four of the fixture's seven headings —
+        # `placements=9 drawn=4` in the diagnostics below. Ask for the rows too.
+        # `remember_window_size` has to go first: while it is on, which is the
+        # default, kitty ignores both of these.
+        "-o", "remember_window_size=no",
+        "-o", "initial_window_width=120c",
+        "-o", "initial_window_height=60c",
         "--listen-on", f"unix:{sock}",
         "--directory", str(REPO),
         "nvim", "--clean", "-u", str(REPO / "tests/text_size_e2e_init.lua"),
@@ -161,41 +245,77 @@ def main():
 
         texts = [t for _, t in runs]
 
-        # Every run must be s=2: nothing else is supposed to emit OSC 66.
-        others = sorted({m for m, _ in runs if m != "s=2"})
-        if others:
-            bad("every scaled run is s=2", f"also saw {others}")
+        # Nothing else in the plugin emits OSC 66, so every run has to be one
+        # of the six heading levels — and at the exact metadata for that level.
+        unknown = sorted({m for m, _ in runs if level_of(m) is None and not is_icon_run(m)})
+        if unknown:
+            bad("every scaled run matches a heading level", f"also saw {unknown}")
         else:
-            ok("every scaled run is s=2")
+            ok("every scaled run matches a heading level")
 
-        # h1 and h2 scale.
-        for want in ("Short Heading", "Second Level"):
-            if any(want == t for t in texts):
-                ok(f"{want!r} is scaled")
+        # Every level reserves a block `s` rows tall while only level 1 fills
+        # it, so anything with a fraction has to say where in that block it
+        # sits. Level 1's text run is the exception: with no fraction Kitty
+        # ignores `v`, so it is not sent.
+        adrift = sorted(
+            {m for m, _ in runs if parse_meta(m).get("n") and parse_meta(m).get("v") != VERTICAL_ALIGN}
+        )
+        if adrift:
+            bad(f"every fractional run is aligned v={VERTICAL_ALIGN}", f"saw {adrift}")
+        else:
+            ok(f"every fractional run is aligned v={VERTICAL_ALIGN}")
+
+        # `w` is capped at 7 by the protocol; past that Kitty is free to
+        # truncate or resize the run.
+        over = sorted({m for m, _ in runs if not 1 <= parse_meta(m).get("w", 1) <= 7})
+        if over:
+            bad("every run asks for 1..7 cells", f"saw {over}")
+        else:
+            ok("every run asks for 1..7 cells")
+
+        # Each level's runs, joined back into the heading they came from.
+        joined = {}
+        for meta, text in runs:
+            level = level_of(meta)
+            if level:
+                joined[level] = joined.get(level, "") + text
+
+        for level, want in LEVEL_TEXT.items():
+            got = joined.get(level, "")
+            if want in got:
+                ok(f"h{level} is scaled")
             else:
-                bad(f"{want!r} is scaled", f"payloads: {texts}")
-
-        # h3 never scales.
-        if any("Third Level" in t for t in texts):
-            bad("h3 is not scaled", f"payloads: {texts}")
-        else:
-            ok("h3 is not scaled")
+                bad(f"h{level} is scaled", f"level {level} payload: {got!r}")
 
         # A long CJK heading wraps into several scaled blocks instead of
-        # falling back to plain size.
-        cjk = [t for t in texts if "あいうえお" in t or "まみむめも" in t]
-        if len(cjk) >= 2:
-            ok(f"long CJK heading wrapped into {len(cjk)} scaled blocks")
+        # falling back to plain size. Both ends have to survive: a heading that
+        # only scaled as far as it happened to fit would keep the first.
+        cjk = joined.get(2, "")
+        if "あいうえお" in cjk and "まみむめも" in cjk:
+            ok("long CJK heading is scaled end to end")
         else:
-            bad("long CJK heading wraps into >= 2 scaled blocks", f"got {cjk}")
+            bad("long CJK heading is scaled end to end", f"level 2 payload: {cjk!r}")
 
-        # The regression that shipped once: the level icon inside a scaled run
-        # is clipped by Kitty and renders as a bare "H".
-        leaked = [t for t in texts if any(icon in t for icon in HEADING_ICONS)]
-        if leaked:
-            bad("the level icon stays out of scaled runs", f"leaked into {leaked}")
+        # The regression that shipped once: a level icon sharing a run with the
+        # heading text is clipped by Kitty and renders as a bare "H". It may
+        # appear, but only alone and only in an icon run.
+        shared = [
+            t for m, t in runs
+            if any(icon in t for icon in HEADING_ICONS) and not (is_icon_run(m) and t in HEADING_ICONS)
+        ]
+        if shared:
+            bad("the level icon only ever goes out in a run of its own", f"saw {shared}")
         else:
-            ok("the level icon stays out of scaled runs")
+            ok("the level icon only ever goes out in a run of its own")
+
+        # And it does go out: without this the check above passes just as
+        # happily on a build that stopped drawing icons altogether.
+        seen_icons = {t for m, t in runs if is_icon_run(m)}
+        missing = [icon for icon in HEADING_ICONS if icon not in seen_icons]
+        if missing:
+            bad("every level's icon is drawn", f"no run for {missing}")
+        else:
+            ok("every level's icon is drawn")
 
         print("\nscaled headings OFF:")
         runs_off, diag_off = run_kitty(args.kitty, False, workdir)
