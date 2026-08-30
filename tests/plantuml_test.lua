@@ -61,6 +61,66 @@ test("produces two hex chars per byte", function()
 end)
 
 -- ============================================================================
+-- Where a diagram is allowed to be rendered
+-- ============================================================================
+
+local function assert_true(val, msg)
+  if val then
+    pass_count = pass_count + 1
+  else
+    fail_count = fail_count + 1
+    print("FAIL: " .. msg)
+  end
+end
+
+--- Run `fn` with only the named executables on the PATH, and with the PlantUML
+--- probe forced to re-run so the stub is what it sees.
+---@param present table<string, true>
+---@param fn fun()
+local function with_executables(present, fn)
+  local real = vim.fn.executable
+  vim.fn.executable = function(name)
+    return present[name] and 1 or 0
+  end
+  image.reset_cache()
+  local ok, err = pcall(fn)
+  vim.fn.executable = real
+  image.reset_cache()
+  if not ok then error(err) end
+end
+
+test("no local renderer and no server: PlantUML is not available", function()
+  image.setup { plantuml_server = "" }
+  with_executables({ curl = true }, function()
+    assert_eq(image.config().plantuml_server, nil, "no server is configured by default")
+    assert_eq(
+      image.has_plantuml(),
+      false,
+      "curl alone does not make it available — that would mean sending the diagram somewhere nobody asked for"
+    )
+  end)
+end)
+
+test("a local renderer is enough on its own", function()
+  image.setup { plantuml_server = "" }
+  with_executables({ plantuml = true }, function()
+    assert_true(image.has_plantuml(), "a `plantuml` on the PATH renders locally, no server needed")
+  end)
+end)
+
+test("naming a server opts into rendering on it", function()
+  image.setup { plantuml_server = "https://plantuml.example.com/plantuml" }
+  with_executables({ curl = true }, function()
+    assert_true(image.has_plantuml(), "a configured server plus curl is enough")
+  end)
+  with_executables({}, function()
+    assert_eq(image.has_plantuml(), false, "but the server still needs curl to reach it")
+  end)
+  image.setup { plantuml_server = "" }
+  assert_eq(image.config().plantuml_server, nil, "an empty server string clears the setting")
+end)
+
+-- ============================================================================
 -- Summary
 -- ============================================================================
 

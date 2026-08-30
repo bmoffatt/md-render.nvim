@@ -253,9 +253,7 @@ test("place: payload is empty (image data is not re-sent)", function()
   local seqs = parse_kitty_sequences(captured_output())
   local _, seq = find_action(seqs, "p")
   assert_true(seq ~= nil, "a=p sequence present")
-  if seq then
-    assert_eq(seq.payload, "", "placement carries no payload — data was already transmitted")
-  end
+  if seq then assert_eq(seq.payload, "", "placement carries no payload — data was already transmitted") end
 
   close_test_win(win, buf)
   teardown()

@@ -727,7 +727,7 @@ function M.setup_images(win, content, ns, opts)
         placement._retries = (placement._retries or 0) + 1
         process_placement(placement)
       elseif has_async_source(placement) and not placement._async_started and placement_near_viewport(placement) then
-        -- A Mermaid diagram or a remote image that was off-screen when the
+        -- A diagram or a remote image that was off-screen when the
         -- window opened has no `path` yet, so the branch above can never pick
         -- it up and it would sit on its placeholder forever. Scrolling it into
         -- view is what asks for it — the same laziness static images get,

@@ -17,7 +17,7 @@ A Markdown rendering engine for Neovim. Transforms raw Markdown into richly high
 - **Images** — local and web images (PNG, JPEG, WebP, GIF, animated GIF) displayed inline via terminal graphics protocol
 - **Video** — local and web video (MP4, WebM, MOV, AVI, MKV, M4V) played as animated frames inline
 - **Mermaid diagrams** — rendered as images inline
-- **PlantUML diagrams** — rendered as images inline, via a local renderer or a remote PlantUML server
+- **PlantUML diagrams** — rendered as images inline by a local renderer, or by a server you name
 - **CommonMark paragraphs** — soft-wrapped source lines join into one paragraph, including a list item's continuation lines and a blockquote body; no extra space is inserted between CJK characters
 - **Nested block structure** — a blockquote, callout, or fenced code block indented to a list item's content is rendered in place, not as literal text
 - **CJK-aware word wrapping** — JIS X 4051 kinsoku shori + optional [BudouX](https://github.com/google/budoux) phrase segmentation via [budoux.lua](https://github.com/delphinus/budoux.lua)
@@ -58,7 +58,7 @@ Or, once the plugin is installed, run `:MdRender demo` to see a built-in demo of
 | [FFmpeg](https://ffmpeg.org/) (`ffmpeg` / `ffprobe`) | JPEG/WebP → PNG conversion, animated GIF / video frame extraction | Falls back to ImageMagick (images only; video requires ffmpeg) |
 | [ImageMagick](https://imagemagick.org/) (`magick`) | JPEG/WebP → PNG, animated GIF frame extraction | `sips` (macOS) handles static conversion; animated GIF requires ffmpeg or magick |
 | [Mermaid CLI](https://github.com/mermaid-js/mermaid-cli) (`mmdc`) | Render Mermaid diagrams as images | Falls back to `npx -y @mermaid-js/mermaid-cli` |
-| [PlantUML](https://plantuml.com/) (`plantuml`, or `java` with `$PLANTUML_JAR`) | Render PlantUML diagrams as images | Falls back to the remote server at `https://www.plantuml.com/plantuml` (needs curl; override with `vim.g.md_render_plantuml_server`) |
+| [PlantUML](https://plantuml.com/) (`plantuml`, or `java` with `$PLANTUML_JAR`) | Render PlantUML diagrams as images | A PlantUML server, if you name one (needs curl); otherwise the fence stays a code block |
 | [budoux.lua](https://github.com/delphinus/budoux.lua) | CJK phrase-level line breaking (BudouX) | Character-level splitting (kinsoku rules still apply) |
 | Treesitter parsers | Syntax highlighting in code blocks | Code blocks rendered without highlighting |
 | [nvim-web-devicons](https://github.com/nvim-tree/nvim-web-devicons) or [mini.icons](https://github.com/echasnovski/mini.icons) | File type icons in code block headers | Built-in icon table |
@@ -401,15 +401,19 @@ Mermaid rendering requires the `mmdc` binary from [@mermaid-js/mermaid-cli](http
 <details>
 <summary><strong>PlantUML diagrams don't render</strong></summary>
 
-Fenced blocks tagged `plantuml` or `puml` are rendered locally when a `plantuml` binary is on your `PATH` (most package managers ship one), or when `java` is available and `$PLANTUML_JAR` points at a readable `plantuml.jar`. Without a local renderer, the plugin falls back to a remote PlantUML server, which requires `curl` and network access — the diagram source is sent to that server, so avoid the remote fallback for confidential diagrams by installing PlantUML locally.
+Fenced blocks tagged `plantuml` or `puml` are rendered locally when a `plantuml` binary is on your `PATH` (most package managers ship one), or when `java` is available and `$PLANTUML_JAR` points at a readable `plantuml.jar`. Install one of those and the fence becomes a diagram.
 
-Point the fallback at your own server with:
+There is no fallback unless you ask for one. PlantUML renders on a server by design, and rendering on somebody else's means sending the diagram there, so the plugin will not choose that for you — without a local renderer, a `plantuml` fence stays a code block. Name a server and it will be used:
 
 ```lua
-vim.g.md_render_plantuml_server = "https://plantuml.example.com/plantuml"
+require("md-render.image").setup {
+  -- Your own instance, or "https://www.plantuml.com/plantuml" for the public
+  -- one. Either way the diagram source is sent there, so pick knowing that.
+  plantuml_server = "https://plantuml.example.com/plantuml",
+}
 ```
 
-Rendered diagrams are cached under `stdpath("cache")/md-render/plantuml`, keyed by the diagram source.
+The server also needs `curl`. Rendered diagrams are cached under `stdpath("cache")/md-render/plantuml`, keyed by the diagram source, so a diagram is only sent once.
 
 </details>
 

@@ -20,6 +20,36 @@ local tty_mod = require "md-render.tty"
 local IS_WINDOWS = ffi.os == "Windows"
 
 -- ============================================================================
+-- Configuration
+-- ============================================================================
+
+---@class MdRender.Image.Config
+---@field plantuml_server string? base URL of a PlantUML server, e.g. `"https://www.plantuml.com/plantuml"`
+
+---@type MdRender.Image.Config
+local config = {
+  -- Unset on purpose. A PlantUML fence is rendered by a local `plantuml` or
+  -- `java -jar $PLANTUML_JAR` if there is one; naming a server here is what
+  -- allows the source of a diagram to leave the machine, and nothing else
+  -- turns that on.
+  plantuml_server = nil,
+}
+
+--- Configure image rendering.
+---@param opts? MdRender.Image.Config
+function M.setup(opts)
+  opts = opts or {}
+  if opts.plantuml_server ~= nil then
+    config.plantuml_server = opts.plantuml_server ~= "" and opts.plantuml_server or nil
+  end
+end
+
+---@return MdRender.Image.Config
+function M.config()
+  return config
+end
+
+-- ============================================================================
 -- Batched terminal writes
 -- ============================================================================
 
@@ -540,22 +570,19 @@ local function find_plantuml()
   _plantuml_checked = true
   if vim.fn.executable "plantuml" == 1 then
     _plantuml_cmd = { "plantuml" }
-  elseif
-    vim.fn.executable "java" == 1
-    and vim.env.PLANTUML_JAR
-    and vim.fn.filereadable(vim.env.PLANTUML_JAR) == 1
-  then
+  elseif vim.fn.executable "java" == 1 and vim.env.PLANTUML_JAR and vim.fn.filereadable(vim.env.PLANTUML_JAR) == 1 then
     _plantuml_cmd = { "java", "-jar", vim.env.PLANTUML_JAR }
   end
   return _plantuml_cmd
 end
 
---- Check if PlantUML rendering is available, locally or via the remote server.
---- More permissive than has_mmdc(): network availability can't be cheaply
---- probed, so curl alone counts as viable.
+--- Check if PlantUML rendering is available, locally or via a configured
+--- server. Network availability can't be cheaply probed, so a server plus
+--- curl counts as viable without asking whether it answers.
 ---@return boolean
 function M.has_plantuml()
-  return find_plantuml() ~= nil or vim.fn.executable "curl" == 1
+  if find_plantuml() ~= nil then return true end
+  return M.config().plantuml_server ~= nil and vim.fn.executable "curl" == 1
 end
 
 --- Compute cache path for PlantUML source.
@@ -577,26 +604,24 @@ function M.get_plantuml_cached(source)
   return nil
 end
 
---- Resolve the remote PlantUML server base URL (read fresh on every call).
----@return string
-local function plantuml_server()
-  local server = vim.g.md_render_plantuml_server
-  if type(server) ~= "string" or server == "" then server = "https://www.plantuml.com/plantuml" end
-  return (server:gsub("/+$", ""))
-end
-
---- Render PlantUML source via the remote HTTP server.
+--- Render PlantUML source via a remote HTTP server.
+---
+--- Only ever reached when the user has named a server: a diagram is the
+--- document, and sending it somewhere is not a fallback this plugin will pick
+--- on its own. Without a local renderer and without a server, a `plantuml`
+--- fence stays a code block — which is what a `mermaid` fence does without
+--- `mmdc`.
 ---@param source string
 ---@param cache_path string
 ---@param callback fun(png_path: string?)
 local function render_plantuml_remote_async(source, cache_path, callback)
-  if vim.fn.executable "curl" ~= 1 then
+  local server = M.config().plantuml_server
+  if not server or vim.fn.executable "curl" ~= 1 then
     callback(nil)
     return
   end
-  local url = plantuml_server() .. "/png/~h" .. plantuml_encode_hex(source)
-  local cmd =
-    { "curl", "-sfL", "--max-time", "15", "--max-filesize", "20000000", "-o", cache_path, url }
+  local url = server:gsub("/+$", "") .. "/png/~h" .. plantuml_encode_hex(source)
+  local cmd = { "curl", "-sfL", "--max-time", "15", "--max-filesize", "20000000", "-o", cache_path, url }
   vim.system(cmd, { text = true }, function()
     vim.schedule(function()
       if vim.fn.filereadable(cache_path) == 1 then
@@ -610,7 +635,8 @@ local function render_plantuml_remote_async(source, cache_path, callback)
 end
 
 --- Render PlantUML source code to a PNG image (asynchronous, cached).
---- Tries a local renderer first, then falls back to the remote server.
+--- Tries a local renderer first, and falls back to a server only when the user
+--- has named one — see `M.setup`.
 ---@param source string PlantUML diagram source code
 ---@param callback fun(png_path: string?)
 function M.render_plantuml_async(source, callback)
